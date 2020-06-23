@@ -162,7 +162,8 @@
 						// in the final end result.
 
 #include "panTompkins.h"
-#include <stdio.h>      // Remove if not using the standard file functions.
+
+#include <assert.h>
 
 
 FILE *fin, *fout;       // Remove them if not using files and <stdio.h>.
@@ -173,10 +174,12 @@ FILE *fin, *fout;       // Remove them if not using files and <stdio.h>.
     a serial connection.
     Remember to update its parameters on the panTompkins.h file as well.
 */
-void init(const char file_in[], const char file_out[])
+void init(FILE *file_in, FILE *file_out)
 {
-	fin = fopen(file_in, "r");
-	fout = fopen(file_out, "w+");
+    assert(file_in != NULL);
+    assert(file_out != NULL);
+    fin = file_in;
+    fout = file_out;
 }
 
 /*
@@ -612,8 +615,4 @@ void panTompkins()
 	// Output the last remaining samples on the buffer
 	for (i = 1; i < BUFFSIZE; i++)
 		output(outputSignal[i]);
-
-	// These last two lines must be deleted if you are not working with files.
-	fclose(fin);
-	fclose(fout);
 }

@@ -33,10 +33,13 @@
 #ifndef PAN_TOMPKINS
 #define PAN_TOMPKINS
 
+#include <stdio.h>
+
 typedef int dataType;
+
 typedef enum {false, true} bool;
 
 void panTompkins();
-void init(char file_in[], char file_out[]);
+void init(FILE *file_in, FILE *file_out);
 
 #endif
