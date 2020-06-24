@@ -16,6 +16,8 @@ set(PAN_TOMPKINS_QRS_INCLUDE_DIR "${PROJECT_SOURCE_DIR}")
 
 add_library(pantompkinsqrs panTompkins.c)
 
+add_library(pantompkinsqrs::pantompkinsqrs ALIAS pantompkinsqrs)
+
 target_include_directories(
     pantompkinsqrs
     PUBLIC

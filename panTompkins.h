@@ -33,13 +33,28 @@
 #ifndef PAN_TOMPKINS
 #define PAN_TOMPKINS
 
-#include <stdio.h>
+#include <stddef.h>
 
-typedef int dataType;
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
-typedef enum {false, true} bool;
+#ifndef PAN_TOMPKINS_SCALAR_TYPE
+#define PAN_TOMPKINS_SCALAR_TYPE int
+#endif
 
-void panTompkins();
-void init(FILE *file_in, FILE *file_out);
+typedef PAN_TOMPKINS_SCALAR_TYPE pan_tompkins_scalar_t;
+
+typedef struct pan_tompkins_context_tag *pan_tompkins_context_t;
+
+pan_tompkins_context_t pan_tompkins_init(int fs, int delay, int window_size, int buffer_size);
+int pan_tompkins_run(pan_tompkins_context_t context, pan_tompkins_scalar_t x);
+void pan_tompkins_run_many(pan_tompkins_context_t context, const pan_tompkins_scalar_t *data, size_t len, int *output);
+void pan_tompkins_free(pan_tompkins_context_t *context);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

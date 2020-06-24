@@ -1,0 +1,3 @@
+[submodule "examples/importdata"]
+	path = examples/importdata
+	url = https://github.com/myd7349/importdata.git

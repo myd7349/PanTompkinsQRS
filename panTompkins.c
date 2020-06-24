@@ -21,6 +21,7 @@
  * 2019/04/23| Rafael M. M. | - Improved comparison of slopes.                   *
  *           |              | - Fixed formula to obtain the correct sample from  *
  *           |              | the buffer on the back search.                     *
+ * 2020/07/01| myd          | -                                                  *
  * ------------------------------------------------------------------------------*
  * MIT License                                                                   *
  *                                                                               *
@@ -150,97 +151,64 @@
  *-------------------------------------------------------------------------------*
  */
 
-#define WINDOWSIZE 20   // Integrator window size, in samples. The article recommends 150ms. So, FS*0.15.
-						// However, you should check empirically if the waveform looks ok.
-#define NOSAMPLE -32000 // An indicator that there are no more samples to read. Use an impossible value for a sample.
-#define FS 360          // Sampling frequency.
-#define BUFFSIZE 600    // The size of the buffers (in samples). Must fit more than 1.66 times an RR interval, which
-                        // typically could be around 1 second.
-
-#define DELAY 22		// Delay introduced by the filters. Filter only output samples after this one.
-						// Set to 0 if you want to keep the delay. Fixing the delay results in DELAY less samples
-						// in the final end result.
-
 #include "panTompkins.h"
 
 #include <assert.h>
+#include <stdlib.h>
 
+//#define WINDOWSIZE 20
+//#define FS 360
+//#define BUFFSIZE 600
+//#define DELAY 22
 
-FILE *fin, *fout;       // Remove them if not using files and <stdio.h>.
+#define BUFFER_LENGTH_IN_SECONDS (10)
 
-/*
-    Use this function for any kind of setup you need before getting samples.
-    This is a good place to open a file, initialize your hardware and/or open
-    a serial connection.
-    Remember to update its parameters on the panTompkins.h file as well.
-*/
-void init(FILE *file_in, FILE *file_out)
+struct pan_tompkins_context_tag
 {
-    assert(file_in != NULL);
-    assert(file_out != NULL);
-    fin = file_in;
-    fout = file_out;
-}
-
-/*
-    Use this function to read and return the next sample (from file, serial,
-    A/D converter etc) and put it in a suitable, numeric format. Return the
-    sample, or NOSAMPLE if there are no more samples.
-*/
-dataType input()
-{
-	int num = NOSAMPLE;
-	if (!feof(fin))
-		fscanf(fin, "%d", &num);
-
-	return num;
-}
-
-/*
-    Use this function to output the information you see fit (last RR-interval,
-    sample index which triggered a peak detection, whether each sample was a R
-    peak (1) or not (0) etc), in whatever way you see fit (write on screen, write
-    on file, blink a LED, call other functions to do other kinds of processing,
-    such as feature extraction etc). Change its parameters to receive the necessary
-    information to output.
-*/
-void output(int out)
-{
-	fprintf(fout, "%d\n", out);
-}
-
-/*
-    This is the actual QRS-detecting function. It's a loop that constantly calls the input and output functions
-    and updates the thresholds and averages until there are no more samples. More details both above and in
-    shorter comments below.
-*/
-void panTompkins()
-{
+    // Sampling frequency.
+    int fs;
+    
+    // Delay introduced by the filters. Filter only output samples after this one.
+	// Set to 0 if you want to keep the delay. Fixing the delay results in DELAY less samples
+	// in the final end result.
+    int delay;
+    
+    // The size of the buffers (in samples). Must fit more than 1.66 times an RR interval, which
+    // typically could be around 1 second.
+    size_t buffer_size;
+    
+    // Integrator window size, in samples. The article recommends 150ms. So, FS*0.15.
+	// However, you should check empirically if the waveform looks ok.
+    size_t window_size;
+    
     // The signal array is where the most recent samples are kept. The other arrays are the outputs of each
     // filtering module: DC Block, low pass, high pass, integral etc.
 	// The output is a buffer where we can change a previous result (using a back search) before outputting.
-	dataType signal[BUFFSIZE], dcblock[BUFFSIZE], lowpass[BUFFSIZE], highpass[BUFFSIZE], derivative[BUFFSIZE], squared[BUFFSIZE], integral[BUFFSIZE], outputSignal[BUFFSIZE];
+	pan_tompkins_scalar_t *signal;
+    pan_tompkins_scalar_t *dcblock;
+    pan_tompkins_scalar_t *lowpass;
+    pan_tompkins_scalar_t *highpass;
+    pan_tompkins_scalar_t *derivative;
+    pan_tompkins_scalar_t *squared;
+    pan_tompkins_scalar_t *integral;
+    int *outputSignal;
 
 	// rr1 holds the last 8 RR intervals. rr2 holds the last 8 RR intervals between rrlow and rrhigh.
 	// rravg1 is the rr1 average, rr2 is the rravg2. rrlow = 0.92*rravg2, rrhigh = 1.08*rravg2 and rrmiss = 1.16*rravg2.
 	// rrlow is the lowest RR-interval considered normal for the current heart beat, while rrhigh is the highest.
 	// rrmiss is the longest that it would be expected until a new QRS is detected. If none is detected for such
 	// a long interval, the thresholds must be adjusted.
-	int rr1[8], rr2[8], rravg1, rravg2, rrlow = 0, rrhigh = 0, rrmiss = 0;
+	double rr1[8], rr2[8], rravg1, rravg2, rrlow, rrhigh, rrmiss;
+    
+    // sample counts how many samples have been read so far.
+    size_t sample;
 
-	// i and j are iterators for loops.
-	// sample counts how many samples have been read so far.
-	// lastQRS stores which was the last sample read when the last R sample was triggered.
-	// lastSlope stores the value of the squared slope when the last R sample was triggered.
-	// currentSlope helps calculate the max. square slope for the present sample.
-	// These are all long unsigned int so that very long signals can be read without messing the count.
-	long unsigned int i, j, sample = 0, lastQRS = 0, lastSlope = 0, currentSlope = 0;
-
-	// This variable is used as an index to work with the signal buffers. If the buffers still aren't
-	// completely filled, it shows the last filled position. Once the buffers are full, it'll always
-	// show the last position, and new samples will make the buffers shift, discarding the oldest
-	// sample and storing the newest one on the last position.
-	int current;
+	// lastQRS stores which was the last sample read when the last R sample was
+    // triggered.
+	size_t lastQRS;
+    
+    // lastSlope stores the value of the squared slope when the last R sample was triggered.
+    pan_tompkins_scalar_t lastSlope;
 
 	// There are the variables from the original Pan-Tompkins algorithm.
 	// The ones ending in _i correspond to values from the integrator.
@@ -249,156 +217,240 @@ void panTompkins()
 	// The threshold 1 variables are the threshold variables. If a signal sample is higher than this threshold, it's a peak.
 	// The threshold 2 variables are half the threshold 1 ones. They're used for a back search when no peak is detected for too long.
 	// The spk and npk variables are, respectively, running estimates of signal and noise peaks.
-	dataType peak_i = 0, peak_f = 0, threshold_i1 = 0, threshold_i2 = 0, threshold_f1 = 0, threshold_f2 = 0, spk_i = 0, spk_f = 0, npk_i = 0, npk_f = 0;
+    pan_tompkins_scalar_t spk_i;
+    pan_tompkins_scalar_t npk_i;
+    pan_tompkins_scalar_t spk_f;
+    pan_tompkins_scalar_t npk_f;
+    pan_tompkins_scalar_t threshold_i1;
+    pan_tompkins_scalar_t threshold_f1;
+    pan_tompkins_scalar_t threshold_i2;
+    pan_tompkins_scalar_t threshold_f2;
+
+	// regular tells whether the heart pace is regular or not.
+	int regular;
+};
+
+
+pan_tompkins_context_t pan_tompkins_init(int fs, int delay, int window_size, int buffer_size)
+{
+    pan_tompkins_context_t context;
+
+    if (fs <= 100 || delay < 0 || window_size <= 0 || buffer_size <= 0)
+        return NULL;
+    
+    context = calloc(1, sizeof(struct pan_tompkins_context_tag));
+    if (context == NULL)
+        return NULL;
+    
+    context->fs = fs;
+    context->delay = delay;
+    context->window_size = window_size;
+
+    context->buffer_size = buffer_size; // fs * BUFFER_LENGTH_IN_SECONDS;
+    
+	context->signal = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->dcblock = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->lowpass = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->highpass = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->derivative = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->squared = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->integral = calloc(context->buffer_size, sizeof(pan_tompkins_scalar_t));
+    context->outputSignal = calloc(context->buffer_size, sizeof(int));
+    if (context->signal == NULL ||
+        context->dcblock == NULL ||
+        context->lowpass == NULL ||
+        context->highpass == NULL ||
+        context->derivative == NULL ||
+        context->squared == NULL ||
+        context->integral == NULL ||
+        context->outputSignal == NULL)
+    {
+        pan_tompkins_free(&context);
+        return NULL;
+    }
+    
+    context->regular = 1;
+
+    return context;
+}
+
+
+int pan_tompkins_run(pan_tompkins_context_t context, pan_tompkins_scalar_t x)
+{
+    int output;
+    pan_tompkins_run_many(context, &x, 1, &output);
+    return output;
+}
+
+
+/*
+    This is the actual QRS-detecting function. It's a loop that constantly calls the input and output functions
+    and updates the thresholds and averages until there are no more samples. More details both above and in
+    shorter comments below.
+*/
+void pan_tompkins_run_many(pan_tompkins_context_t context, const pan_tompkins_scalar_t *data, size_t len, int *output)
+{
+    size_t c;
+    size_t i, j;
+
+	// currentSlope helps calculate the max. square slope for the present sample.
+	// lastSlope and currentSlope are all long unsigned int so that very long signals can be read without messing the count.
+    pan_tompkins_scalar_t currentSlope = 0;
+
+	// This variable is used as an index to work with the signal buffers. If the buffers still aren't
+	// completely filled, it shows the last filled position. Once the buffers are full, it'll always
+	// show the last position, and new samples will make the buffers shift, discarding the oldest
+	// sample and storing the newest one on the last position.
+	size_t current;
+
+	// There are the variables from the original Pan-Tompkins algorithm.
+	// The ones ending in _i correspond to values from the integrator.
+	// The ones ending in _f correspond to values from the DC-block/low-pass/high-pass filtered signal.
+	pan_tompkins_scalar_t peak_i = 0, peak_f = 0;
 
 	// qrs tells whether there was a detection or not.
-	// regular tells whether the heart pace is regular or not.
 	// prevRegular tells whether the heart beat was regular before the newest RR-interval was calculated.
-	bool qrs, regular = true, prevRegular;
-
-	// Initializing the RR averages
-	for (i = 0; i < 8; i++)
-    {
-        rr1[i] = 0;
-        rr2[i] = 0;
-    }
+	int qrs, prevRegular;
+    
+    assert(context != NULL);
+    assert(data != NULL && len > 0);
+    assert(output != NULL);
 
     // The main loop where everything proposed in the paper happens. Ends when there are no more signal samples.
-    do{
+    for (c = 0; c < len; ++c)
+    {
         // Test if the buffers are full.
         // If they are, shift them, discarding the oldest sample and adding the new one at the end.
         // Else, just put the newest sample in the next free position.
         // Update 'current' so that the program knows where's the newest sample.
-		if (sample >= BUFFSIZE)
+		if (context->sample >= context->buffer_size)
 		{
-			for (i = 0; i < BUFFSIZE - 1; i++)
+			for (i = 0; i < context->buffer_size - 1; i++)
 			{
-				signal[i] = signal[i+1];
-				dcblock[i] = dcblock[i+1];
-				lowpass[i] = lowpass[i+1];
-				highpass[i] = highpass[i+1];
-				derivative[i] = derivative[i+1];
-				squared[i] = squared[i+1];
-				integral[i] = integral[i+1];
-				outputSignal[i] = outputSignal[i+1];
+				context->signal[i] = context->signal[i+1];
+				context->dcblock[i] = context->dcblock[i+1];
+				context->lowpass[i] = context->lowpass[i+1];
+				context->highpass[i] = context->highpass[i+1];
+				context->derivative[i] = context->derivative[i+1];
+				context->squared[i] = context->squared[i+1];
+				context->integral[i] = context->integral[i+1];
+				context->outputSignal[i] = context->outputSignal[i+1];
 			}
-			current = BUFFSIZE - 1;
+			current = context->buffer_size - 1;
 		}
 		else
 		{
-			current = sample;
+			current = context->sample;
 		}
-		signal[current] = input();
+		context->signal[current] = data[c];
 
-		// If no sample was read, stop processing!
-		if (signal[current] == NOSAMPLE)
-			break;
-		sample++; // Update sample counter
+		context->sample++; // Update sample counter
+        
+        *output = -1;
 
 		// DC Block filter
 		// This was not proposed on the original paper.
 		// It is not necessary and can be removed if your sensor or database has no DC noise.
 		if (current >= 1)
-			dcblock[current] = signal[current] - signal[current-1] + 0.995*dcblock[current-1];
+			context->dcblock[current] = (pan_tompkins_scalar_t)(context->signal[current] - context->signal[current-1] + 0.995*context->dcblock[current-1]);
 		else
-			dcblock[current] = 0;
+			context->dcblock[current] = 0;
 
 		// Low Pass filter
 		// Implemented as proposed by the original paper.
 		// y(nT) = 2y(nT - T) - y(nT - 2T) + x(nT) - 2x(nT - 6T) + x(nT - 12T)
 		// Can be removed if your signal was previously filtered, or replaced by a different filter.
-		lowpass[current] = dcblock[current];
+		context->lowpass[current] = context->dcblock[current];
 		if (current >= 1)
-			lowpass[current] += 2*lowpass[current-1];
+			context->lowpass[current] += 2*context->lowpass[current-1];
 		if (current >= 2)
-			lowpass[current] -= lowpass[current-2];
+			context->lowpass[current] -= context->lowpass[current-2];
 		if (current >= 6)
-			lowpass[current] -= 2*dcblock[current-6];
+			context->lowpass[current] -= 2*context->dcblock[current-6];
 		if (current >= 12)
-			lowpass[current] += dcblock[current-12];
+			context->lowpass[current] += context->dcblock[current-12];
 
 		// High Pass filter
 		// Implemented as proposed by the original paper.
 		// y(nT) = 32x(nT - 16T) - [y(nT - T) + x(nT) - x(nT - 32T)]
 		// Can be removed if your signal was previously filtered, or replaced by a different filter.
-		highpass[current] = -lowpass[current];
+		context->highpass[current] = -context->lowpass[current];
 		if (current >= 1)
-			highpass[current] -= highpass[current-1];
+			context->highpass[current] -= context->highpass[current-1];
 		if (current >= 16)
-			highpass[current] += 32*lowpass[current-16];
+			context->highpass[current] += 32*context->lowpass[current-16];
 		if (current >= 32)
-			highpass[current] += lowpass[current-32];
+			context->highpass[current] += context->lowpass[current-32];
 
 		// Derivative filter
 		// This is an alternative implementation, the central difference method.
 		// f'(a) = [f(a+h) - f(a-h)]/2h
 		// The original formula used by Pan-Tompkins was:
 		// y(nT) = (1/8T)[-x(nT - 2T) - 2x(nT - T) + 2x(nT + T) + x(nT + 2T)]
-        derivative[current] = highpass[current];
+        context->derivative[current] = context->highpass[current];
 		if (current > 0)
-			derivative[current] -= highpass[current-1];
+			context->derivative[current] -= context->highpass[current-1];
 
 		// This just squares the derivative, to get rid of negative values and emphasize high frequencies.
 		// y(nT) = [x(nT)]^2.
-		squared[current] = derivative[current]*derivative[current];
+		context->squared[current] = context->derivative[current]*context->derivative[current];
 
 		// Moving-Window Integration
 		// Implemented as proposed by the original paper.
 		// y(nT) = (1/N)[x(nT - (N - 1)T) + x(nT - (N - 2)T) + ... x(nT)]
 		// WINDOWSIZE, in samples, must be defined so that the window is ~150ms.
 
-		integral[current] = 0;
-		for (i = 0; i < WINDOWSIZE; i++)
+		context->integral[current] = 0;
+		for (i = 0; i < context->window_size; i++)
 		{
-			if (current >= (dataType)i)
-				integral[current] += squared[current - i];
+			if (current >= i)
+				context->integral[current] += context->squared[current - i];
 			else
 				break;
 		}
-		integral[current] /= (dataType)i;
+		context->integral[current] /= (pan_tompkins_scalar_t)i;
 
-		qrs = false;
+		qrs = 0; // false
 
 		// If the current signal is above one of the thresholds (integral or filtered signal), it's a peak candidate.
-        if (integral[current] >= threshold_i1 || highpass[current] >= threshold_f1)
+        if (context->integral[current] >= context->threshold_i1 || context->highpass[current] >= context->threshold_f1)
         {
-            peak_i = integral[current];
-            peak_f = highpass[current];
+            peak_i = context->integral[current];
+            peak_f = context->highpass[current];
         }
 
 		// If both the integral and the signal are above their thresholds, they're probably signal peaks.
-		if ((integral[current] >= threshold_i1) && (highpass[current] >= threshold_f1))
+		if ((context->integral[current] >= context->threshold_i1) && (context->highpass[current] >= context->threshold_f1))
 		{
 			// There's a 200ms latency. If the new peak respects this condition, we can keep testing.
-			if (sample > lastQRS + FS/5)
+			if (context->sample > context->lastQRS + context->fs/5)
 			{
 			    // If it respects the 200ms latency, but it doesn't respect the 360ms latency, we check the slope.
-				if (sample <= lastQRS + (long unsigned int)(0.36*FS))
+				if (context->sample <= context->lastQRS + (size_t)(0.36*context->fs))
 				{
 				    // The squared slope is "M" shaped. So we have to check nearby samples to make sure we're really looking
 				    // at its peak value, rather than a low one.
 				    currentSlope = 0;
 				    for (j = current - 10; j <= current; j++)
-                        if (squared[j] > currentSlope)
-                            currentSlope = squared[j];
+                        if (context->squared[j] > currentSlope)
+                            currentSlope = context->squared[j];
 
-				    if (currentSlope <= (dataType)(lastSlope/2))
+				    if (currentSlope <= context->lastSlope / 2)
                     {
-                        qrs = false;
+                        qrs = 0;
                     }
-
                     else
                     {
-                        spk_i = 0.125*peak_i + 0.875*spk_i;
-                        threshold_i1 = npk_i + 0.25*(spk_i - npk_i);
-                        threshold_i2 = 0.5*threshold_i1;
+                        context->spk_i = (pan_tompkins_scalar_t)(0.125*peak_i + 0.875*context->spk_i);
+                        context->threshold_i1 = (pan_tompkins_scalar_t)(context->npk_i + 0.25*(context->spk_i - context->npk_i));
+                        context->threshold_i2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_i1);
 
-                        spk_f = 0.125*peak_f + 0.875*spk_f;
-                        threshold_f1 = npk_f + 0.25*(spk_f - npk_f);
-                        threshold_f2 = 0.5*threshold_f1;
+                        context->spk_f = (pan_tompkins_scalar_t)(0.125*peak_f + 0.875*context->spk_f);
+                        context->threshold_f1 = (pan_tompkins_scalar_t)(context->npk_f + 0.25*(context->spk_f - context->npk_f));
+                        context->threshold_f2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_f1);
 
-                        lastSlope = currentSlope;
-                        qrs = true;
+                        context->lastSlope = currentSlope;
+                        qrs = 1; // true
                     }
 				}
 				// If it was above both thresholds and respects both latency periods, it certainly is a R peak.
@@ -406,87 +458,86 @@ void panTompkins()
 				{
 				    currentSlope = 0;
                     for (j = current - 10; j <= current; j++)
-                        if (squared[j] > currentSlope)
-                            currentSlope = squared[j];
+                        if (context->squared[j] > currentSlope)
+                            currentSlope = context->squared[j];
 
-                    spk_i = 0.125*peak_i + 0.875*spk_i;
-                    threshold_i1 = npk_i + 0.25*(spk_i - npk_i);
-                    threshold_i2 = 0.5*threshold_i1;
+                    context->spk_i = (pan_tompkins_scalar_t)(0.125*peak_i + 0.875*context->spk_i);
+                    context->threshold_i1 = (pan_tompkins_scalar_t)(context->npk_i + 0.25*(context->spk_i - context->npk_i));
+                    context->threshold_i2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_i1);
 
-                    spk_f = 0.125*peak_f + 0.875*spk_f;
-                    threshold_f1 = npk_f + 0.25*(spk_f - npk_f);
-                    threshold_f2 = 0.5*threshold_f1;
+                    context->spk_f = (pan_tompkins_scalar_t)(0.125*peak_f + 0.875*context->spk_f);
+                    context->threshold_f1 = (pan_tompkins_scalar_t)(context->npk_f + 0.25*(context->spk_f - context->npk_f));
+                    context->threshold_f2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_f1);
 
-                    lastSlope = currentSlope;
-                    qrs = true;
+                    context->lastSlope = currentSlope;
+                    qrs = 1; // true
 				}
 			}
 			// If the new peak doesn't respect the 200ms latency, it's noise. Update thresholds and move on to the next sample.
 			else
             {
-                peak_i = integral[current];
-				npk_i = 0.125*peak_i + 0.875*npk_i;
-				threshold_i1 = npk_i + 0.25*(spk_i - npk_i);
-				threshold_i2 = 0.5*threshold_i1;
-				peak_f = highpass[current];
-				npk_f = 0.125*peak_f + 0.875*npk_f;
-				threshold_f1 = npk_f + 0.25*(spk_f - npk_f);
-                threshold_f2 = 0.5*threshold_f1;
-                qrs = false;
-				outputSignal[current] = qrs;
-				if (sample > DELAY + BUFFSIZE)
-                	output(outputSignal[0]);
+                peak_i = (pan_tompkins_scalar_t)(context->integral[current]);
+				context->npk_i = (pan_tompkins_scalar_t)(0.125*peak_i + 0.875*context->npk_i);
+				context->threshold_i1 = (pan_tompkins_scalar_t)(context->npk_i + 0.25*(context->spk_i - context->npk_i));
+				context->threshold_i2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_i1);
+				peak_f = context->highpass[current];
+				context->npk_f = (pan_tompkins_scalar_t)(0.125*peak_f + 0.875*context->npk_f);
+				context->threshold_f1 = (pan_tompkins_scalar_t)(context->npk_f + 0.25*(context->spk_f - context->npk_f));
+                context->threshold_f2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_f1);
+                qrs = 0; // false
+				context->outputSignal[current] = qrs;
+				if (context->sample > context->delay + context->buffer_size)
+                    *output++ = context->outputSignal[0];
                 continue;
             }
-
 		}
 
 		// If a R-peak was detected, the RR-averages must be updated.
 		if (qrs)
 		{
 			// Add the newest RR-interval to the buffer and get the new average.
-			rravg1 = 0;
+			context->rravg1 = 0;
 			for (i = 0; i < 7; i++)
 			{
-				rr1[i] = rr1[i+1];
-				rravg1 += rr1[i];
+				context->rr1[i] = context->rr1[i+1];
+				context->rravg1 += context->rr1[i];
 			}
-			rr1[7] = sample - lastQRS;
-			lastQRS = sample;
-			rravg1 += rr1[7];
-			rravg1 *= 0.125;
+			context->rr1[7] = (double)(context->sample - context->lastQRS);
+			context->lastQRS = context->sample;
+			context->rravg1 += context->rr1[7];
+			context->rravg1 = context->rravg1 * 0.125;
 
 			// If the newly-discovered RR-average is normal, add it to the "normal" buffer and get the new "normal" average.
 			// Update the "normal" beat parameters.
-			if ( (rr1[7] >= rrlow) && (rr1[7] <= rrhigh) )
+			if ( (context->rr1[7] >= context->rrlow) && (context->rr1[7] <= context->rrhigh) )
 			{
-				rravg2 = 0;
+				context->rravg2 = 0;
 				for (i = 0; i < 7; i++)
 				{
-					rr2[i] = rr2[i+1];
-					rravg2 += rr2[i];
+					context->rr2[i] = context->rr2[i+1];
+					context->rravg2 += context->rr2[i];
 				}
-				rr2[7] = rr1[7];
-				rravg2 += rr2[7];
-				rravg2 *= 0.125;
-				rrlow = 0.92*rravg2;
-				rrhigh = 1.16*rravg2;
-				rrmiss = 1.66*rravg2;
+				context->rr2[7] = context->rr1[7];
+				context->rravg2 += context->rr2[7];
+				context->rravg2 = context->rravg2 * 0.125;
+				context->rrlow = 0.92*context->rravg2;
+				context->rrhigh = 1.16*context->rravg2;
+				context->rrmiss = 1.66*context->rravg2;
 			}
 
-			prevRegular = regular;
-			if (rravg1 == rravg2)
+			prevRegular = context->regular;
+			if (context->rravg1 == context->rravg2)
 			{
-				regular = true;
+				context->regular = 1; // true
 			}
 			// If the beat had been normal but turned odd, change the thresholds.
 			else
 			{
-				regular = false;
+				context->regular = 0; // true
 				if (prevRegular)
 				{
-					threshold_i1 /= 2;
-					threshold_f1 /= 2;
+					context->threshold_i1 /= 2;
+					context->threshold_f1 /= 2;
 				}
 			}
 		}
@@ -495,76 +546,76 @@ void panTompkins()
 		{
 		    // If no R-peak was detected for too long, use the lighter thresholds and do a back search.
 			// However, the back search must respect the 200ms limit and the 360ms one (check the slope).
-			if ((sample - lastQRS > (long unsigned int)rrmiss) && (sample > lastQRS + FS/5))
+			if ((context->sample - context->lastQRS > (long unsigned int)context->rrmiss) && (context->sample > context->lastQRS + context->fs/5))
 			{
-				for (i = current - (sample - lastQRS) + FS/5; i < (long unsigned int)current; i++)
+				for (i = current - (context->sample - context->lastQRS) + context->fs/5; i < (long unsigned int)current; i++)
 				{
-					if ( (integral[i] > threshold_i2) && (highpass[i] > threshold_f2))
+					if ( (context->integral[i] > context->threshold_i2) && (context->highpass[i] > context->threshold_f2))
 					{
 					    currentSlope = 0;
                         for (j = i - 10; j <= i; j++)
-                            if (squared[j] > currentSlope)
-                                currentSlope = squared[j];
+                            if (context->squared[j] > currentSlope)
+                                currentSlope = context->squared[j];
 
-                        if ((currentSlope < (dataType)(lastSlope/2)) && (i + sample) < lastQRS + 0.36*lastQRS)
+                        if ((currentSlope < context->lastSlope / 2) && (i + context->sample) < context->lastQRS + 0.36*context->lastQRS)
                         {
-                            qrs = false;
+                            qrs = 0; // false
                         }
                         else
                         {
-                            peak_i = integral[i];
-                            peak_f = highpass[i];
-                            spk_i = 0.25*peak_i+ 0.75*spk_i;
-                            spk_f = 0.25*peak_f + 0.75*spk_f;
-                            threshold_i1 = npk_i + 0.25*(spk_i - npk_i);
-                            threshold_i2 = 0.5*threshold_i1;
-                            lastSlope = currentSlope;
-                            threshold_f1 = npk_f + 0.25*(spk_f - npk_f);
-                            threshold_f2 = 0.5*threshold_f1;
+                            peak_i = context->integral[i];
+                            peak_f = context->highpass[i];
+                            context->spk_i = (pan_tompkins_scalar_t)(0.25*peak_i+ 0.75*context->spk_i);
+                            context->spk_f = (pan_tompkins_scalar_t)(0.25*peak_f + 0.75*context->spk_f);
+                            context->threshold_i1 = (pan_tompkins_scalar_t)(context->npk_i + 0.25*(context->spk_i - context->npk_i));
+                            context->threshold_i2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_i1);
+                            context->lastSlope = currentSlope;
+                            context->threshold_f1 = (pan_tompkins_scalar_t)(context->npk_f + 0.25*(context->spk_f - context->npk_f));
+                            context->threshold_f2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_f1);
                             // If a signal peak was detected on the back search, the RR attributes must be updated.
                             // This is the same thing done when a peak is detected on the first try.
                             //RR Average 1
-                            rravg1 = 0;
+                            context->rravg1 = 0;
                             for (j = 0; j < 7; j++)
                             {
-                                rr1[j] = rr1[j+1];
-                                rravg1 += rr1[j];
+                                context->rr1[j] = context->rr1[j+1];
+                                context->rravg1 += context->rr1[j];
                             }
-                            rr1[7] = sample - (current - i) - lastQRS;
-                            qrs = true;
-                            lastQRS = sample - (current - i);
-                            rravg1 += rr1[7];
-                            rravg1 *= 0.125;
+                            context->rr1[7] = (double)(context->sample - (current - i) - context->lastQRS);
+                            qrs = 1; // true
+                            context->lastQRS = context->sample - (current - i);
+                            context->rravg1 += context->rr1[7];
+                            context->rravg1 = context->rravg1 * 0.125;
 
                             //RR Average 2
-                            if ( (rr1[7] >= rrlow) && (rr1[7] <= rrhigh) )
+                            if ( (context->rr1[7] >= context->rrlow) && (context->rr1[7] <= context->rrhigh) )
                             {
-                                rravg2 = 0;
+                                context->rravg2 = 0;
                                 for (i = 0; i < 7; i++)
                                 {
-                                    rr2[i] = rr2[i+1];
-                                    rravg2 += rr2[i];
+                                    context->rr2[i] = context->rr2[i+1];
+                                    context->rravg2 += context->rr2[i];
                                 }
-                                rr2[7] = rr1[7];
-                                rravg2 += rr2[7];
-                                rravg2 *= 0.125;
-                                rrlow = 0.92*rravg2;
-                                rrhigh = 1.16*rravg2;
-                                rrmiss = 1.66*rravg2;
+                                context->rr2[7] = context->rr1[7];
+                                context->rravg2 += context->rr2[7];
+                                context->rravg2 = context->rravg2 * 0.125;
+                                context->rrlow = 0.92*context->rravg2;
+                                context->rrhigh = 1.16*context->rravg2;
+                                context->rrmiss = 1.66*context->rravg2;
                             }
 
-                            prevRegular = regular;
-                            if (rravg1 == rravg2)
+                            prevRegular = context->regular;
+                            if (context->rravg1 == context->rravg2)
                             {
-                                regular = true;
+                                context->regular = 1; // true
                             }
                             else
                             {
-                                regular = false;
+                                context->regular = 0; // false
                                 if (prevRegular)
                                 {
-                                    threshold_i1 /= 2;
-                                    threshold_f1 /= 2;
+                                    context->threshold_i1 /= 2;
+                                    context->threshold_f1 /= 2;
                                 }
                             }
 
@@ -575,10 +626,10 @@ void panTompkins()
 
 				if (qrs)
                 {
-                    outputSignal[current] = false;
-                    outputSignal[i] = true;
-                    if (sample > DELAY + BUFFSIZE)
-                        output(outputSignal[0]);
+                    context->outputSignal[current] = 0; // false
+                    context->outputSignal[i] = 1; // true
+                    if (context->sample > context->delay + context->buffer_size)
+                        *output++ = context->outputSignal[0];
                     continue;
                 }
 			}
@@ -587,16 +638,16 @@ void panTompkins()
 			if (!qrs)
 			{
 				// If some kind of peak had been detected, then it's certainly a noise peak. Thresholds must be updated accordinly.
-				if ((integral[current] >= threshold_i1) || (highpass[current] >= threshold_f1))
+				if ((context->integral[current] >= context->threshold_i1) || (context->highpass[current] >= context->threshold_f1))
 				{
-					peak_i = integral[current];
-					npk_i = 0.125*peak_i + 0.875*npk_i;
-					threshold_i1 = npk_i + 0.25*(spk_i - npk_i);
-					threshold_i2 = 0.5*threshold_i1;
-					peak_f = highpass[current];
-					npk_f = 0.125*peak_f + 0.875*npk_f;
-					threshold_f1 = npk_f + 0.25*(spk_f - npk_f);
-					threshold_f2 = 0.5*threshold_f1;
+					peak_i = context->integral[current];
+					context->npk_i = (pan_tompkins_scalar_t)(0.125*peak_i + 0.875*context->npk_i);
+					context->threshold_i1 = (pan_tompkins_scalar_t)(context->npk_i + 0.25*(context->spk_i - context->npk_i));
+					context->threshold_i2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_i1);
+					peak_f = context->highpass[current];
+					context->npk_f = (pan_tompkins_scalar_t)(0.125*peak_f + 0.875*context->npk_f);
+					context->threshold_f1 = (pan_tompkins_scalar_t)(context->npk_f + 0.25*(context->spk_f - context->npk_f));
+					context->threshold_f2 = (pan_tompkins_scalar_t)(0.5 * context->threshold_f1);
 				}
 			}
 		}
@@ -607,12 +658,41 @@ void panTompkins()
 		// However, it updates a few samples back from the buffer. The reason is that if we update the detection
 		// for the current sample, we might miss a peak that could've been found later by backsearching using
 		// lighter thresholds. The final waveform output does match the original signal, though.
-		outputSignal[current] = qrs;
-		if (sample > DELAY + BUFFSIZE)
-			output(outputSignal[0]);
-	} while (signal[current] != NOSAMPLE);
+		context->outputSignal[current] = qrs;
+		if (context->sample > context->delay + context->buffer_size)
+			*output++ = context->outputSignal[0];
+	}
 
 	// Output the last remaining samples on the buffer
-	for (i = 1; i < BUFFSIZE; i++)
-		output(outputSignal[i]);
+	//for (i = 1; i < context->buffer_size; i++)
+	//	output(context->outputSignal[i]);
+}
+
+
+#define FREE_X_(ptr) \
+    do \
+    { \
+        if ((ptr) != NULL) \
+        { \
+            free((ptr)); \
+            (ptr) = NULL; \
+        } \
+    } while (0)
+
+
+void pan_tompkins_free(pan_tompkins_context_t *context)
+{
+    if (context != NULL && *context != NULL)
+    {
+        FREE_X_((*context)->signal);
+        FREE_X_((*context)->dcblock);
+        FREE_X_((*context)->lowpass);
+        FREE_X_((*context)->highpass);
+        FREE_X_((*context)->derivative);
+        FREE_X_((*context)->squared);
+        FREE_X_((*context)->integral);
+        FREE_X_((*context)->outputSignal);
+        
+        FREE_X_(*context);
+    }
 }
