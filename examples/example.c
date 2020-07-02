@@ -78,7 +78,7 @@ int main(int argc, char *argv[]) {
       pan_tompkins_free(&qrs_detector);
     }
 
-    free_data(&data);
+    free_data(data);
   }
 
   fclose(fin);
